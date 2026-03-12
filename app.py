@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------
-# 1. 과목 및 설정 (새 과목을 만드실 때 이 부분만 수정하세요)
+# 1. 과목 및 설정 (수정 시 이 부분만 확인하세요)
 # ---------------------------------------------------------
 SUBJECT_NAME = "소비자재무설계 퀴즈"  # 과목 제목
 CURRENT_WEEK = "2주차"           # 해당 주차
@@ -21,7 +21,6 @@ QUIZ_DATA = [
     {"q": "7. 돈의 심리학 저자는 “사람들이 금융 의사결정을 내릴 때는, 냉철하게 (_________)이기 보다는 꽤 적당히 합리적”이라고 설명한다.", "a": "이성적"}
 ]
 
-# 문항 수를 자동으로 계산합니다.
 NUM_QUESTIONS = len(QUIZ_DATA) 
 # ---------------------------------------------------------
 
@@ -34,11 +33,9 @@ try:
 except:
     st.error("구글 시트 연결 설정(Secrets)이 필요합니다.")
 
-# [세션 상태] 기기별 제출 여부 메모리
 if "submitted_on_this_device" not in st.session_state:
     st.session_state.submitted_on_this_device = False
 
-# --- 메인 화면 UI ---
 st.title(f"📊 {SUBJECT_NAME}")
 
 tab1, tab2, tab3 = st.tabs(["✍️ 퀴즈 제출", "🖥️ 제출자 명단 확인", "🔐 성적 분석(교수용)"])
@@ -65,14 +62,14 @@ with tab1:
                 ans = st.text_input(f"{i+1}번 답안", key=f"q{i}")
                 user_responses.append(ans)
 
-            # 1. 제출 버튼 문구 수정
-            submitted = st.form_submit_button("답안 제출하고 확인받기 (기기당 답안 제출은 1회만 가능하니, 신중하게 검토하고 버튼 누르세요)")
+            submitted = st.form_submit_button("답안 제출하기")
 
             if submitted:
                 if not name or not student_id:
                     st.error("이름과 학번을 입력해 주세요.")
                 else:
                     try:
+                        # 제출 시 중복 확인을 위해 실시간 데이터 읽기
                         master_df = conn.read(worksheet="전체데이터", ttl=0)
                         
                         already_exists = master_df[
@@ -83,7 +80,6 @@ with tab1:
                         if not already_exists.empty:
                             st.error(f"❌ {name} 학생은 이미 이번 주 답안을 제출했습니다.")
                         else:
-                            # 2. 제출 시간 포맷 수정 (한국 표준시 KST 적용)
                             kst = timezone(timedelta(hours=9))
                             now_time = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S")
                             
@@ -94,11 +90,12 @@ with tab1:
                                 "학번": student_id
                             }
                             
-                            # 채점 (순서 무관 채점 방식)
+                            # 채점 로직 (영어 대소문자 무시 적용)
                             total_correct = 0
                             for i, item in enumerate(QUIZ_DATA, 1):
-                                s_ans_set = set(item['a'].replace(" ", "").split(","))
-                                u_ans_set = set(user_responses[i-1].replace(" ", "").split(","))
+                                # 양측 답안 모두 공백 제거 및 소문자 변환 후 비교
+                                s_ans_set = set(item['a'].replace(" ", "").lower().split(","))
+                                u_ans_set = set(user_responses[i-1].replace(" ", "").lower().split(","))
                                 
                                 is_correct = (s_ans_set == u_ans_set)
                                 if is_correct: total_correct += 1
@@ -107,29 +104,29 @@ with tab1:
                                 row_dict[f"q{i}_결과"] = "O" if is_correct else "X"
                             
                             row_dict["총점"] = total_correct
-                            new_row = pd.DataFrame([row_dict])
-
-                            # 할당량 초과 방지를 위한 '전체데이터' 단일 저장
-                            updated_master = pd.concat([master_df, new_row], ignore_index=True)
+                            
+                            # 데이터 업데이트
+                            updated_master = pd.concat([master_df, pd.DataFrame([row_dict])], ignore_index=True)
                             conn.update(worksheet="전체데이터", data=updated_master)
                             
                             st.session_state.submitted_on_this_device = True
                             st.success(f"{name} 학생, 제출 성공! ({total_correct}/{NUM_QUESTIONS})")
-                            st.balloons()
+                            # st.balloons() # 트래픽 최적화를 위해 애니메이션 주석 처리 권장
                             st.rerun() 
                             
                     except Exception as e:
-                        # 3. 과부하 안내 문구 삭제 (pass로 처리)
+                        # 과부하 시 pass 처리하여 사용자 불편 최소화
                         pass
 
-# --- [TAB 2] 수동 새로고침 명단 (429 에러 방지용) ---
+# --- [TAB 2] 제출 명단 확인 (트래픽 최적화 적용) ---
 with tab2:
     st.subheader(f"📍 {CURRENT_WEEK} 제출 완료 명단")
     st.info("명단을 확인하려면 아래 버튼을 누르세요.")
     
-    if st.button("🔄 명단 새로고침 (클릭)"):
+    if st.button("🔄 명단 확인/새로고침"):
         try:
-            data = conn.read(worksheet="전체데이터", ttl=0)
+            # 트래픽 부하 감소를 위해 5분 캐시(ttl=300) 적용
+            data = conn.read(worksheet="전체데이터", ttl=300)
             today_list = data[data['주차'] == CURRENT_WEEK]
             
             if not today_list.empty:
@@ -150,6 +147,7 @@ with tab3:
     if admin_pw == ADMIN_PASSWORD:
         st.success("인증 성공")
         try:
+            # 관리자용 데이터는 실시간 로드
             data = conn.read(worksheet="전체데이터", ttl=0)
             if not data.empty:
                 st.subheader("학생별 평균 정답률")
@@ -164,5 +162,3 @@ with tab3:
             st.error("데이터 로드 실패")
     elif admin_pw != "":
         st.error("비밀번호 불일치")
-
-
