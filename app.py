@@ -1,5 +1,5 @@
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
+from supabase import create_client, Client
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 # 1. 과목 및 설정 (수정 시 이 부분만 확인하세요)
 # ---------------------------------------------------------
 SUBJECT_NAME = "소비자재무설계 퀴즈"  # 과목 제목
-CURRENT_WEEK = "6주차"           # 해당 주차
+CURRENT_WEEK = "6주차"            # 해당 주차
 ADMIN_PASSWORD = "3383"          # 선생님용 비밀번호
 
 # 퀴즈 데이터 (수동으로 제공해주신 7문항 반영)
@@ -21,18 +21,23 @@ QUIZ_DATA = [
     {"q": "7. 저축은 소득에서 무엇을 뺀 것인가?", "a": "자존심"}
 ]
 
-
 NUM_QUESTIONS = len(QUIZ_DATA) 
 # ---------------------------------------------------------
 
 # 페이지 설정
 st.set_page_config(page_title=f"{SUBJECT_NAME}", layout="wide")
 
-# 구글 시트 연결
+# Supabase 연결 설정
+@st.cache_resource
+def init_connection() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
 try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-except:
-    st.error("구글 시트 연결 설정(Secrets)이 필요합니다.")
+    supabase = init_connection()
+except Exception as e:
+    st.error("수파베이스 연결 설정(Secrets)이 필요합니다.")
 
 if "submitted_on_this_device" not in st.session_state:
     st.session_state.submitted_on_this_device = False
@@ -70,15 +75,10 @@ with tab1:
                     st.error("이름과 학번을 입력해 주세요.")
                 else:
                     try:
-                        # 제출 시 중복 확인을 위해 실시간 데이터 읽기
-                        master_df = conn.read(worksheet="전체데이터", ttl=0)
-                        
-                        already_exists = master_df[
-                            (master_df['주차'] == CURRENT_WEEK) & 
-                            (master_df['학번'] == student_id)
-                        ]
+                        # 제출 시 중복 확인을 위해 수파베이스 데이터 조회
+                        existing_data = supabase.table("quiz_inha_fin_results").select("*").eq("주차", CURRENT_WEEK).eq("학번", student_id).execute()
 
-                        if not already_exists.empty:
+                        if existing_data.data: # 데이터가 존재하면
                             st.error(f"❌ {name} 학생은 이미 이번 주 답안을 제출했습니다.")
                         else:
                             kst = timezone(timedelta(hours=9))
@@ -106,9 +106,8 @@ with tab1:
                             
                             row_dict["총점"] = total_correct
                             
-                            # 데이터 업데이트
-                            updated_master = pd.concat([master_df, pd.DataFrame([row_dict])], ignore_index=True)
-                            conn.update(worksheet="전체데이터", data=updated_master)
+                            # 수파베이스에 데이터 Insert
+                            supabase.table("quiz_inha_fin_results").insert(row_dict).execute()
                             
                             st.session_state.submitted_on_this_device = True
                             st.success(f"{name} 학생, 제출 성공! ({total_correct}/{NUM_QUESTIONS})")
@@ -116,19 +115,19 @@ with tab1:
                             st.rerun() 
                             
                     except Exception as e:
-                        # 과부하 시 pass 처리하여 사용자 불편 최소화
+                        # 과부하/에러 시 pass 처리하여 사용자 불편 최소화
                         pass
 
-# --- [TAB 2] 제출 명단 확인 (트래픽 최적화 적용) ---
+# --- [TAB 2] 제출 명단 확인 ---
 with tab2:
     st.subheader(f"📍 {CURRENT_WEEK} 제출 완료 명단")
     st.info("명단을 확인하려면 아래 버튼을 누르세요.")
     
     if st.button("🔄 명단 확인/새로고침"):
         try:
-            # 트래픽 부하 감소를 위해 5분 캐시(ttl=300) 적용
-            data = conn.read(worksheet="전체데이터", ttl=300)
-            today_list = data[data['주차'] == CURRENT_WEEK]
+            # 수파베이스에서 이번 주차 데이터만 바로 로드 (수파베이스는 응답이 매우 빨라 캐싱 없이도 원활함)
+            response = supabase.table("quiz_inha_fin_results").select("*").eq("주차", CURRENT_WEEK).execute()
+            today_list = pd.DataFrame(response.data)
             
             if not today_list.empty:
                 st.write(f"현재 총 {len(today_list)}명 제출 완료")
@@ -137,7 +136,7 @@ with tab2:
                     cols[i % 6].success(f"✅ {row.이름}")
             else:
                 st.write("아직 제출자가 없습니다.")
-        except:
+        except Exception as e:
             st.error("데이터 로드 실패")
 
 # --- [TAB 3] 성적 분석 ---
@@ -148,8 +147,10 @@ with tab3:
     if admin_pw == ADMIN_PASSWORD:
         st.success("인증 성공")
         try:
-            # 관리자용 데이터는 실시간 로드
-            data = conn.read(worksheet="전체데이터", ttl=0)
+            # 관리자용 데이터 로드
+            response = supabase.table("quiz_inha_fin_results").select("*").execute()
+            data = pd.DataFrame(response.data)
+            
             if not data.empty:
                 st.subheader("학생별 평균 정답률")
                 stats = data.groupby(['학번', '이름'])['총점'].mean().reset_index()
@@ -159,8 +160,7 @@ with tab3:
                 st.download_button("엑셀 데이터 다운로드", data=data.to_csv(index=False).encode('utf-8-sig'), file_name=f"{SUBJECT_NAME}_결과.csv", mime="text/csv")
             else:
                 st.info("데이터가 없습니다.")
-        except:
+        except Exception as e:
             st.error("데이터 로드 실패")
     elif admin_pw != "":
         st.error("비밀번호 불일치")
-
